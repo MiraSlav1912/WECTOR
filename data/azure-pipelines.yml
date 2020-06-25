@@ -1,0 +1,321 @@
+trigger:
+- master
+- refs/tags/v*
+
+variables:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+- job: 'Linux'
+  pool:
+    vmImage: 'Ubuntu-16.04'
+  strategy:
+    matrix:
+      Python35:
+        python.version: '3.5'
+      Python36:
+        python.version: '3.6'
+      Python37:
+        python.version: '3.7'
+      Python38:
+          python.version: '3.8'
+
+  steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '$(python.version)'
+      architecture: 'x64'
+
+  - script: |
+      python -m pip install --upgrade pip twine
+      pip install -r data/requirements.txt
+      sudo apt-get install libhackrf-dev librtlsdr-dev xvfb libxkbcommon-x11-0 x11-utils
+      pip install twine setuptools wheel pytest pytest-xvfb pytest-cov pytest-faulthandler
+      python -c "import tempfile, os; open(os.path.join(tempfile.gettempdir(), 'urh_releasing'), 'w').close()"
+    displayName: 'Install dependencies'
+
+  - script: python src/urh/cythonext/build.py
+    displayName: "Build extensions"
+  
+  - script: python setup.py sdist
+    displayName: "Build sdist"
+    condition: eq(variables['python.version'], '3.7')
+
+  - script: |
+      docker run --rm \
+      -e PYVER=$(python -c "import sys; print('%s%s' % (sys.version_info.major, sys.version_info.minor))") \
+      -v `pwd`:/io jopohl/urh_manylinux2014 /io/data/make_manylinux2014_wheels.sh
+    displayName: "Build wheel"
+
+  - script: |
+      pip install dist/*.whl
+      urh --version
+      xvfb-run urh autoclose
+    displayName: 'Test Run'
+
+  - script: python data/check_native_backends.py
+    displayName: 'Check native backends'
+
+  - script: twine upload --skip-existing dist/*
+    displayName: "PyPi Upload"
+    condition: contains(variables['Build.SourceBranch'], 'refs/tags/')
+    env:
+      TWINE_USERNAME: $(twine.username)
+      TWINE_PASSWORD: $(twine.password)
+      TWINE_REPOSITORY_URL: "https://upload.pypi.org/legacy/"
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      pathtoPublish: dist/
+      artifactName: 'dist'
+    displayName: "Publish Build Artifacts"
+
+  - script: |
+      touch tests/show_gui
+      cp tests/.coveragerc .
+      pytest -s -v --junitxml=junit/test-results.xml --cov=src --cov-config=.coveragerc tests
+    displayName: 'Run pytest with coverage'
+    condition: eq(variables['python.version'], '3.7')
+
+  - script: |
+      coverage xml
+      coverage html
+    displayName: 'Generate coverage report'
+    condition: eq(variables['python.version'], '3.7')
+
+  - script: pytest -s -v --junitxml=junit/test-results.xml tests
+    displayName: 'Run pytest without coverage'
+    condition: ne(variables['python.version'], '3.7')
+
+  - task: PublishTestResults@2
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFiles: '**/test-*.xml'
+      testRunTitle: 'Publish test results for Python $(python.version)'
+
+  - task: PublishCodeCoverageResults@1
+    inputs:
+      codeCoverageTool: Cobertura
+      summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+      reportDirectory: '$(System.DefaultWorkingDirectory)/**/htmlcov'
+    condition: eq(variables['python.version'], '3.7')
+
+  - task: mspremier.BuildQualityChecks.QualityChecks-task.BuildQualityChecks@5
+    displayName: 'Check coverage'
+    condition: eq(variables['python.version'], '3.7')
+    inputs:
+      checkCoverage: true
+      allowCoverageVariance: true
+      coverageVariance: 0.4
+      coverageDeltaType: percentage
+      coverageType: lines
+      baseBranchRef: refs/heads/master
+
+- job: 'Windows'
+  pool:
+    vmImage: 'vs2017-win2016'
+  strategy:
+    matrix:
+      Python37-64:
+        python.version: '3.7'
+        python.arch: 'x64'
+      Python37-32:
+        python.version: '3.7'
+        python.arch: 'x86'
+
+  steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '$(python.version)'
+      architecture: '$(python.arch)'
+
+  - powershell: |
+      git clone --depth 1 https://gitlab.com/jopohl/sdr_drivers
+      if ("$(python.arch)" -eq "x86") {
+      Copy-Item "sdr_drivers\win-32.zip" -Destination "C:\windlls.zip"
+      }
+      else {
+      Copy-Item "sdr_drivers\win-64.zip" -Destination "C:\windlls.zip"
+      }
+      Copy-Item "sdr_drivers\*.whl"  -Destination "C:\"
+    displayName: 'download SDR drivers'
+
+  - script: |
+      python -m pip install --upgrade pip
+      pip install -r data/requirements.txt
+      pip install pytest pytest-faulthandler
+    displayName: 'Install dependencies'
+
+  - task: ExtractFiles@1
+    inputs:
+      archiveFilePatterns: 'C:\windlls.zip'
+      destinationFolder: src\urh\dev\native\lib\shared
+      #cleanDestinationFolder: true
+
+  - script: python src/urh/cythonext/build.py
+    displayName: "Build extensions"
+
+  - script: |
+      pip install --upgrade wheel twine six appdirs packaging setuptools pyinstaller pywin32
+      pip install "pyaudio; python_version < '3.7'"
+      pip install "C:\PyAudio-0.2.11-cp37-cp37m-win_amd64.whl; python_version == '3.7'"
+      pip install "C:\PyAudio-0.2.11-cp37-cp37m-win32.whl; python_version == '3.7'"
+      python -c "import tempfile, os; open(os.path.join(tempfile.gettempdir(), 'urh_releasing'), 'w').close()"
+    displayName: "Install build dependencies"
+
+  - script: python setup.py bdist_wheel
+    displayName: "Build python wheel"
+
+  - script: |
+      python data/pyinstaller_helper.py
+      for /f %%i in ('python src/urh/version.py') do set URHVERSION=%%i
+      iscc /dMyAppVersion=%URHVERSION% /dArch=$(python.arch) data/inno.iss
+    condition: or(contains(variables['Build.SourceBranch'], 'refs/tags/'), eq(variables['python.arch'], 'x64'))
+    displayName: "Create setup.exe"
+
+  - script: |
+      cd pyinstaller\urh
+      urh_debug.exe autoclose
+    condition: or(contains(variables['Build.SourceBranch'], 'refs/tags/'), eq(variables['python.arch'], 'x64'))
+    displayName: "Test urh_debug.exe"
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      pathtoPublish: dist/
+      artifactName: 'dist'
+    displayName: "Publish Build Artifacts"
+
+  - script: twine upload --skip-existing dist/*.whl
+    displayName: "Upload wheel to PyPi"
+    condition: contains(variables['Build.SourceBranch'], 'refs/tags/')
+    env:
+      TWINE_USERNAME: $(twine.username)
+      TWINE_PASSWORD: $(twine.password)
+      TWINE_REPOSITORY_URL: "https://upload.pypi.org/legacy/"
+
+  - task: GitHubRelease@0
+    displayName: 'GitHub release'
+    condition: contains(variables['Build.SourceBranch'], 'refs/tags/')
+    inputs:
+      gitHubConnection: 'github connection 1'
+      action: 'edit'
+      tag: $(Build.SourceBranchName)
+      repositoryName: jopohl/urh
+      assets: 'dist/*.exe'
+      assetUploadMode: 'replace'
+      addChangeLog: true
+
+  - script: pytest -s -v --junitxml=junit/test-results.xml tests
+    displayName: 'Run pytest on windows'
+
+  - task: PublishTestResults@2
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFiles: '**/test-*.xml'
+      testRunTitle: 'Publish test results for Python $(python.version)'
+
+  - script: |
+      pip install .
+      urh --version
+      urh autoclose
+    displayName: 'Testrun'
+
+- job: 'macOS'
+  pool:
+    vmImage: 'macOS-10.14'
+
+  steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.7'
+
+  - script: |
+      git clone --depth 1 https://gitlab.com/jopohl/sdr_drivers
+      mkdir src/urh/dev/native/lib/shared
+      tar xf sdr_drivers/osx-64.tar.bz2 -C src/urh/dev/native/lib/shared
+      mkdir /tmp/osx-64
+      tar xf sdr_drivers/osx-64.tar.bz2 -C /tmp/osx-64
+      rm -rf sdr_drivers
+    displayName: "download and unpack SDR drivers"
+
+  - script: |
+      python -m pip install --upgrade pip
+      python -m pip install --upgrade -r data/requirements.txt
+      python -m pip install --upgrade pytest pytest-faulthandler
+    displayName: 'Install dependencies'
+
+  - script: |
+      brew install portaudio hackrf librtlsdr airspy
+      python -m pip install --upgrade wheel twine six appdirs packaging setuptools pyinstaller pyaudio
+      python -c "import tempfile, os; open(os.path.join(tempfile.gettempdir(), 'urh_releasing'), 'w').close()"
+    displayName: "Install build dependencies"
+
+  - script: |
+      brew install https://raw.githubusercontent.com/Homebrew/homebrew-core/8d748e26ccc9afc8ea0d0201ae234fda35de721e/Formula/boost.rb
+      cd /tmp
+      wget https://github.com/libusb/libusb/releases/download/v1.0.22/libusb-1.0.22.tar.bz2
+      tar xf libusb-1.0.22.tar.bz2
+      cd libusb-1.0.22
+      ./configure
+      make
+      sudo make install
+    displayName: "Install libusb and boost"
+
+  - script: python src/urh/cythonext/build.py
+    displayName: "Build extensions"
+
+  - script: python setup.py bdist_wheel
+    displayName: "Build python wheel"
+
+  - script: python data/pyinstaller_helper.py
+    displayName: "Run PyInstaller"
+
+  - script: |
+      mkdir -p dist
+      cat pyinstaller/urh.app/Contents/Info.plist
+      hdiutil create -volname Universal.Radio.Hacker \
+                     -srcfolder pyinstaller/urh.app \
+                     -ov -format UDZO \
+                     dist/Universal.Radio.Hacker-"$(python src/urh/version.py)".dmg
+    displayName: "Build DMG"
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      pathtoPublish: dist/
+      artifactName: 'dist'
+    displayName: "Publish Build Artifacts"
+
+  - task: GitHubRelease@0
+    displayName: 'GitHub release'
+    condition: contains(variables['Build.SourceBranch'], 'refs/tags/')
+    inputs:
+      gitHubConnection: 'github connection 1'
+      action: 'edit'
+      tag: $(Build.SourceBranchName)
+      repositoryName: jopohl/urh
+      assets: 'dist/*.dmg'
+      assetUploadMode: 'replace'
+      addChangeLog: true
+
+  - script: twine upload --skip-existing dist/*.whl
+    displayName: "Upload wheel to PyPi"
+    condition: contains(variables['Build.SourceBranch'], 'refs/tags/')
+    env:
+      TWINE_USERNAME: $(twine.username)
+      TWINE_PASSWORD: $(twine.password)
+      TWINE_REPOSITORY_URL: "https://upload.pypi.org/legacy/"
+
+  - script: pytest -s -v --junitxml=junit/test-results.xml tests
+    displayName: 'Run pytest on macOS'
+
+  - task: PublishTestResults@2
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFiles: '**/test-*.xml'
+      testRunTitle: 'Publish test results for Python $(python.version)'
+
+  - script: |
+      pip install .
+      urh --version
+      urh autoclose
+    displayName: 'Testrun'
